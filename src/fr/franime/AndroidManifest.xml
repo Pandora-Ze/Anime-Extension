@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:icon="@mipmap/ic_launcher">
+        <meta-data
+            android:name="eu.kanade.tachiyomi.animeextension.nsfw"
+            android:value="1" />
+        <activity
+            android:name=".fr.franime.FrAnimeUrlActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="https" />
+                <data android:host="franime.fr" />
+                <data android:pathPattern="/anime/..*" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

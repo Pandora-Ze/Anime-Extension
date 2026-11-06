@@ -1,0 +1,679 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package fr.bluecxt.core.source
+
+import android.annotation.SuppressLint
+import android.app.Application
+import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import android.util.Log
+import androidx.annotation.StringRes
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
+import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.FetchType
+import eu.kanade.tachiyomi.animesource.model.Hoster
+import eu.kanade.tachiyomi.animesource.model.SAnime
+import eu.kanade.tachiyomi.animesource.model.SEpisode
+import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
+import fr.bluecxt.core.SERVER_LOG
+import fr.bluecxt.core.extractors.router.getVideoServer
+import fr.bluecxt.core.filters.FilterProvider
+import fr.bluecxt.core.model.ContentUnavailableException
+import fr.bluecxt.core.model.ExtractedSource
+import fr.bluecxt.core.model.RateLimitException
+import fr.bluecxt.core.monitoring.ErrorWebhook
+import fr.bluecxt.core.preference.CommonPreferences
+import fr.bluecxt.core.tmdb.TmdbMetadata
+import fr.bluecxt.core.tmdb.fetchTmdbMetadata
+import fr.bluecxt.core.utils.ExtensionResources
+import fr.bluecxt.core.utils.NeedsRefactor
+import fr.bluecxt.core.utils.addClientHints
+import fr.bluecxt.core.utils.safeHttpCode
+import fr.bluecxt.core.utils.withDefaultHeaders
+import keiyoushi.core.BuildConfig
+import keiyoushi.utils.getPreferencesLazy
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Dispatcher
+import okhttp3.Headers
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+import uy.kohesive.injekt.injectLazy
+import java.io.IOException
+import java.net.URLEncoder
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.random.Random
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+val EXTRACTOR_TIMEOUT = 30.seconds
+
+/**
+ * Global semaphore to limit the number of concurrent extractions.
+ * Prevents overwhelming video servers and local DNS/OkHttp connection pools.
+ */
+private val extractionSemaphore = Semaphore(10)
+
+/**
+ * Base class for all French Anime Extensions using extensions-lib v16.
+ * Separated from keiyoushi utils to allow custom French logic.
+ */
+abstract class Source :
+    AnimeHttpSource(),
+    ConfigurableAnimeSource,
+    FilterProvider {
+
+    val preferences: SharedPreferences by getPreferencesLazy()
+
+    override fun getFilterList(): AnimeFilterList = buildFilterList()
+
+    fun getString(@StringRes resId: Int, vararg formatArgs: Any): String {
+        val app = Injekt.get<Application>()
+        return try {
+            val res = ExtensionResources.getResources(app, this.javaClass) ?: app.resources
+            if (formatArgs.isNotEmpty()) {
+                res.getString(resId, *formatArgs)
+            } else {
+                res.getString(resId)
+            }
+        } catch (_: Exception) {
+            try {
+                app.getString(resId, *formatArgs)
+            } catch (_: Exception) {
+                ""
+            }
+        }
+    }
+
+    val currentName: String by lazy {
+        try {
+            name
+        } catch (_: Exception) {
+            "Unknown"
+        }
+    }
+
+    val currentVersion: String by lazy {
+        try {
+            val app = Injekt.get<Application>()
+            ExtensionResources.getVersionName(app, this.javaClass)
+                ?: (
+                    this.javaClass.`package`?.name?.let { pkg ->
+                        try {
+                            app.packageManager.getPackageInfo(pkg, 0).versionName
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                    )
+                ?: "Unknown"
+        } catch (_: Exception) {
+            "Unknown"
+        }
+    }
+
+    /**
+     * Determines whether the source domain has been manually overridden by the user.
+     */
+    val isCustomDomain: Boolean
+        get() {
+            val defaultUrl = (this as? CommonPreferences)?.defaultBaseUrl
+            return !defaultUrl.isNullOrBlank() && baseUrl != defaultUrl
+        }
+
+    open val json: Json = Json {
+        ignoreUnknownKeys = true
+        coerceInputValues = true
+    }
+
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
+        .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
+        .set("Connection", "close")
+        .addClientHints()
+
+    override val client: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .dispatcher(
+                Dispatcher().apply {
+                    maxRequests = 64
+                    maxRequestsPerHost = 20
+                },
+            )
+            .addInterceptor { chain ->
+                logUsage()
+                chain.proceed(chain.request())
+            }.build()
+    }
+
+    val extractorClient: OkHttpClient by lazy {
+        client.newBuilder().apply {
+            interceptors().removeAll { it.javaClass.simpleName.contains("Cloudflare") }
+        }.build()
+    }
+
+    /**
+     * Sends an error webhook payload to the telemetry service with explicit extension metadata.
+     *
+     * This utility allows extension implementations to report custom parsing or scraping failures
+     * (e.g., failed regex matches or HTML structure changes) while ensuring that the extension's
+     * name and version are accurately attached to the report.
+     *
+     * @param url The target URL associated with the failure.
+     * @param context Descriptive context or details outlining the nature of the error.
+     * @param exception Optional exception instance associated with the failure for diagnostic output.
+     */
+    fun sendErrorWebhook(url: String, context: String, exception: Throwable? = null) {
+        if (isCustomDomain) return
+        ErrorWebhook.sendWebhook(
+            baseUrl = baseUrl,
+            url = url,
+            extensionName = currentName,
+            extensionVersion = currentVersion,
+            additionalContext = listOfNotNull(
+                context,
+                exception?.let { "${it::class.java.simpleName}: ${it.message}" },
+            ),
+            throwable = exception,
+        )
+    }
+
+    // ============================ Utils =============================
+
+    fun ExtractedSource.buildFromSource(lang: String?, name: String): Video {
+        val sourceQuality = this.quality
+        val sourceFrameRate = this.frameRate
+        val sourceUrl = this.url
+
+        val finalVideo = Video(
+            videoUrl = sourceUrl,
+            videoTitle = buildString {
+                if (!lang.isNullOrBlank()) append("($lang) ")
+                append(name)
+                if (!sourceFrameRate.isNullOrBlank() || !sourceQuality.isNullOrBlank()) append(" ✦ ")
+                if (!sourceQuality.isNullOrBlank()) append(sourceQuality)
+                if (!sourceFrameRate.isNullOrBlank() && !sourceQuality.isNullOrBlank()) append(" ⫻ ")
+                if (!sourceFrameRate.isNullOrBlank()) append(sourceFrameRate)
+            },
+            headers = this.headers,
+            subtitleTracks = this.subtitleTracks,
+            audioTracks = this.audioTracks,
+            internalData = if (this.isError) """{"isError": true}""" else "",
+        ).withDefaultHeaders(sourceUrl)
+
+        Log.d(SERVER_LOG, "title = ${finalVideo.videoTitle} url = ${finalVideo.videoUrl}")
+
+        return finalVideo
+    }
+
+    suspend fun extractVideos(playerUrl: String, lang: String? = null, allowedServers: List<String>): List<Video> {
+        val isFilemoonDisabled = preferences.getBoolean(CommonPreferences.PREF_DISABLE_FILEMOON_KEY, false)
+
+        val filteredAllowedServers = if (isFilemoonDisabled) {
+            allowedServers.filterNot { it.equals("Filemoon", ignoreCase = true) }
+        } else {
+            allowedServers
+        }
+
+        val servers = filteredAllowedServers.mapNotNull { getVideoServer(this, it) }
+        val server = servers.find { s -> s.matches(playerUrl) } ?: return emptyList()
+
+        val rawSources = try {
+            extractionSemaphore.withPermit {
+                withTimeoutOrNull(EXTRACTOR_TIMEOUT) {
+                    delay(Random.nextLong(0, 500).milliseconds)
+                    server.extractor(playerUrl)
+                }
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) {
+                Log.d(SERVER_LOG, "Job was cancelled by the app for ${server.name}")
+                throw e
+            }
+
+            val httpCode = e.safeHttpCode
+            val isUnavailable = e is ContentUnavailableException ||
+                httpCode == 404 || httpCode == 410
+
+            if (isUnavailable) {
+                Log.w(SERVER_LOG, "Content unavailable on ${server.name}: ${e.message}")
+                emptyList()
+            } else if (e is RateLimitException) {
+                Log.w(SERVER_LOG, "Rate limited on ${server.name}: ${e.message}")
+                if (BuildConfig.DEBUG) {
+                    listOf(
+                        ExtractedSource(
+                            url = playerUrl,
+                            quality = "Rate Limited: ${server.name}",
+                            isError = true,
+                        ),
+                    )
+                } else {
+                    emptyList()
+                }
+            } else {
+                Log.e(SERVER_LOG, "Server failed: ${server.name}: ${e.message ?: e.javaClass.simpleName}", e)
+                if (BuildConfig.DEBUG) {
+                    listOf(
+                        ExtractedSource(
+                            url = playerUrl,
+                            quality = e.message ?: e.javaClass.simpleName,
+                            isError = true,
+                        ),
+                    )
+                } else {
+                    emptyList()
+                }
+            }
+        } ?: run {
+            Log.w(SERVER_LOG, "Timeout ($EXTRACTOR_TIMEOUT): ${server.name}")
+            if (BuildConfig.DEBUG) {
+                listOf(
+                    ExtractedSource(
+                        url = playerUrl,
+                        quality = "Timeout ($EXTRACTOR_TIMEOUT)",
+                        isError = true,
+                    ),
+                )
+            } else {
+                emptyList()
+            }
+        }
+
+        return rawSources.map { it.buildFromSource(lang, server.name) }
+    }
+
+    protected fun getServerName(url: String, allowedServers: List<String>): String? {
+        val servers = allowedServers.mapNotNull { getVideoServer(this, it) }
+        return servers.find { s -> s.matches(url) }?.name
+    }
+
+    /**
+     * Safely sets the fetch type using reflection for backward compatibility.
+     */
+    @Deprecated(
+        "y'a pas de backward compatibility",
+        replaceWith = ReplaceWith("fetch_type = type"),
+    )
+    protected fun SAnime.coreSetFetchType(type: FetchType) {
+        try {
+            val methods = this.javaClass.methods
+            val setter = methods.find { it.name == "setFetch_type" }
+            if (setter != null) {
+                val appFetchTypeClass = setter.parameterTypes[0]
+                val enumValue = appFetchTypeClass.enumConstants?.find { it.toString() == type.name }
+                setter.invoke(this, enumValue)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Safely sets the season number using reflection for backward compatibility.
+     */
+    @Deprecated(
+        "y'a pas de backward compatibility",
+        replaceWith = ReplaceWith("season_number = season"),
+    )
+    protected fun SAnime.coreSetSeasonNumber(season: Double) {
+        try {
+            val methods = this.javaClass.methods
+            val setter = methods.find { it.name == "setSeason_number" }
+            if (setter != null) {
+                setter.invoke(this, season)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Standardized video sorting based on user preferences.
+     */
+    public override fun List<Video>.sortVideos(): List<Video> {
+        val voices = preferences.getString(CommonPreferences.PREF_VOICES_KEY, "VOSTFR")!!
+        val player = preferences.getString(CommonPreferences.PREF_SERVER_KEY, "sibnet")!!
+        val prefQualStr = preferences.getString(CommonPreferences.PREF_QUALITY_KEY, "Highest")!!
+        val prefQualInt = prefQualStr.toIntOrNull()
+
+        return this.sortedWith(
+            compareByDescending<Video> { !it.internalData.contains(""""isError":true""") && !it.internalData.contains(""""isError": true""") }
+                .thenByDescending { it.videoTitle.contains(voices, true) }
+                .thenByDescending { it.videoTitle.contains(player, true) }
+                .thenByDescending { video ->
+                    val actualQual = QUALITY_REGEX.find(video.videoTitle)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    if (prefQualInt == null) {
+                        actualQual
+                    } else {
+                        1000000 - abs(actualQual - prefQualInt)
+                    }
+                }
+                .thenByDescending { video ->
+                    FPS_REGEX.find(video.videoTitle)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                },
+        )
+    }
+
+    /**
+     * Standardized hoster sorting based on language tags and user preferences.
+     */
+    override fun List<Hoster>.sortHosters(): List<Hoster> {
+        val prefVoice = preferences.getString(CommonPreferences.PREF_VOICES_KEY, "VOSTFR")!!
+        val prefServer = preferences.getString(CommonPreferences.PREF_SERVER_KEY, "sibnet")!!
+
+        return this.sortedWith(
+            compareByDescending<Hoster> {
+                it.hosterName.contains("($prefVoice)", true) || it.hosterName.contains(
+                    prefVoice,
+                    true,
+                )
+            }
+                .thenBy {
+                    LANG_REGEX.find(it.hosterName)?.value ?: "(Unknown)"
+                }
+                .thenByDescending { it.hosterName.contains(prefServer, true) },
+        )
+    }
+
+    @Deprecated("Use sortHosters() instead", replaceWith = ReplaceWith("sortHosters()"))
+    fun List<Hoster>.coreSortHosters(): List<Hoster> = sortHosters()
+
+    // ============================ Season Engine =============================
+
+    /**
+     * Optimized title display logic according to REPO_RULES.
+     * Shortens seasons to numbers and detects special sub-titles/spin-offs.
+     * Prepends full title to description if shortened to a sub-title.
+     */
+    @NeedsRefactor("wtf is that with thousand of Regex everywher")
+    protected fun SAnime.coreOptimizeDisplayTitle(fullTitle: String, seriesTitle: String) {
+        var isSubTitleOnly = false
+        val effectiveSeriesTitle = if (seriesTitle.isNotEmpty() && fullTitle.contains(seriesTitle, ignoreCase = true)) {
+            seriesTitle
+        } else if (this.title.isNotEmpty() && fullTitle.contains(this.title, ignoreCase = true)) {
+            this.title
+        } else {
+            ""
+        }
+
+        if (effectiveSeriesTitle.isNotEmpty()) {
+            val suffix = fullTitle.split(Regex("(?i)${Regex.escape(effectiveSeriesTitle)}"), 2)
+                .last().trim().removePrefix(":").removePrefix("-").trim()
+
+            if (suffix.isNotEmpty()) {
+                val isStandardSeason =
+                    suffix.matches(Regex("""(?i)(?:Saison|Season|Partie|Part|Film|Movie|OAV|OVA|Special|HS|Kai|\d+).*"""))
+                if (!isStandardSeason) {
+                    this.title = suffix
+                    isSubTitleOnly = true
+                }
+            }
+        }
+
+        // REPO_RULES: "Saison X" -> "X" for consistency and space (Saison 1 is removed)
+        this.title = this.title
+            .replace(Regex("""(?i)\s*-\s*Saison\s*1(?!\d)"""), "")
+            .replace(Regex("""(?i)\s*Saison\s*1(?!\d)"""), "")
+            .replace(Regex("""(?i)\s*-\s*Saison\s*(\d+)"""), " $1")
+            .replace(Regex("""(?i)\s*Saison\s*(\d+)"""), " $1")
+            .replace(Regex("""(?i)Partie\s*(\d+)"""), "Part $1")
+            .trim()
+
+        // Always put raw full title at the very top if the display title was optimized to a subtitle
+        val isNumericSeason = this.title.matches(Regex("""(?i).*\s*\d+$|^Saison\s*\d+$|^\d+$"""))
+        if (isSubTitleOnly || (this.title != fullTitle && !isNumericSeason)) {
+            this.description = "$fullTitle\n\n${this.description ?: ""}"
+        }
+    }
+
+    /**
+     * Builds a standardized list of SAnime seasons for hierarchical mode.
+     * Applies TMDB continuation fallbacks and REPO_RULES automatically.
+     */
+    protected suspend fun coreBuildSeasonList(
+        baseTitle: String,
+        siteSeasons: List<Triple<String, String, Int>>, // Title, URL, SiteSNum
+        defStatus: Int = SAnime.UNKNOWN,
+    ): List<SAnime> = siteSeasons.mapIndexed { index, (sTitle, sUrl, siteSNum) ->
+        val tmdbMeta = fetchTmdbMetadata(baseTitle, siteSNum)
+        val isContinuation = siteSNum > 1 && (tmdbMeta == null || tmdbMeta.episodeSummaries.size < 2)
+        val finalMeta = if (isContinuation) fetchTmdbMetadata(baseTitle, siteSNum - 1) else tmdbMeta
+
+        SAnime.create().apply {
+            this.title = sTitle
+            this.url = sUrl
+            thumbnail_url = finalMeta?.seasonPosterUrl ?: finalMeta?.mainPosterUrl
+            description = finalMeta?.summary
+            genre = finalMeta?.genre
+            author = finalMeta?.author
+            artist = finalMeta?.artist
+            status = if (index < siteSeasons.size - 1) SAnime.COMPLETED else (finalMeta?.status ?: defStatus)
+
+            coreOptimizeDisplayTitle(sTitle, baseTitle)
+            fetch_type = FetchType.Episodes
+            season_number = siteSNum.toDouble()
+            initialized = true
+        }
+    }
+
+    /**
+     * Calculates the episode offset for TMDB alignment.
+     * Handles seasons mapping and OAV overflow detection.
+     */
+    protected suspend fun coreCalculateEpisodeOffset(
+        baseTitle: String,
+        targetTmdbSNum: Int,
+        previousSeasonsCounts: Map<Int, Int>, // SiteSNum -> EpisodeCount
+    ): Pair<Int, Int> {
+        var siteOffsetAccumulator = 0
+        var oavOffsetAccumulator = 0
+        var lastTmdbSNum = -1
+
+        val sortedSiteSeasons = previousSeasonsCounts.keys.sorted()
+
+        for (sNum in sortedSiteSeasons) {
+            val siteCount = previousSeasonsCounts[sNum] ?: 0
+
+            // Determine TMDB Season
+            var tmdbS = sNum
+            val meta = fetchTmdbMetadata(baseTitle, tmdbS)
+            if (sNum > 1 && (meta == null || meta.episodeSummaries.size < 2)) {
+                tmdbS = sNum - 1
+            }
+
+            if (tmdbS != lastTmdbSNum) {
+                siteOffsetAccumulator = 0
+                oavOffsetAccumulator = 0
+                lastTmdbSNum = tmdbS
+            }
+
+            if (tmdbS == targetTmdbSNum) {
+                // We reached the current group
+                return siteOffsetAccumulator to oavOffsetAccumulator
+            }
+
+            // Accumulate counts for previous groups
+            val currentTmdbMeta = fetchTmdbMetadata(baseTitle, tmdbS)
+            val currentTmdbCount = currentTmdbMeta?.episodeSummaries?.size ?: 0
+
+            if (currentTmdbCount > 0) {
+                val remainingInTmdb = maxOf(0, currentTmdbCount - siteOffsetAccumulator)
+                siteOffsetAccumulator += minOf(siteCount, remainingInTmdb)
+                if (siteCount > remainingInTmdb) {
+                    oavOffsetAccumulator += (siteCount - remainingInTmdb)
+                }
+            } else {
+                siteOffsetAccumulator += siteCount
+            }
+        }
+
+        return siteOffsetAccumulator to oavOffsetAccumulator
+    }
+
+    /**
+     * Maps raw episodes to TMDB metadata with offsets and formatting.
+     */
+    protected fun coreMapEpisodes(
+        rawEpisodes: List<SEpisode>,
+        tmdbMetadata: TmdbMetadata?,
+        tmdbS0Metadata: TmdbMetadata?,
+        offsets: Pair<Int, Int>, // Pair(siteOffset, oavOffset)
+        sNum: Int,
+        isMovie: Boolean = false,
+        isOav: Boolean = false,
+    ): List<SEpisode> {
+        val (siteOffset, oavOffset) = offsets
+        val tmdbSeasonEpisodeCount = tmdbMetadata?.episodeSummaries?.size ?: 0
+
+        return rawEpisodes.map { episode ->
+            val epNum = episode.episode_number.toInt()
+            val absEpNum = epNum + siteOffset
+
+            var epMeta = tmdbMetadata?.episodeSummaries?.get(absEpNum)
+
+            // If not found and we are beyond the season count, try Season 0 (Specials)
+            if (epMeta == null && tmdbSeasonEpisodeCount > 0 && absEpNum > tmdbSeasonEpisodeCount) {
+                val s0EpNum = (absEpNum - tmdbSeasonEpisodeCount) + oavOffset
+                epMeta = tmdbS0Metadata?.episodeSummaries?.get(s0EpNum)
+            }
+
+            val tmdbName = epMeta?.first
+            val currentName = episode.name.replace("Épisode", "Episode", true)
+
+            val formattedName = formatName(currentName, tmdbName, epNum)
+
+            val sPrefix = when {
+                isMovie -> "[Movie] "
+                isOav -> "[Special] "
+                sNum > 1 -> "[S$sNum] "
+                else -> ""
+            }
+
+            episode.apply {
+                name = "$sPrefix$formattedName"
+                preview_url = epMeta?.second
+                summary = epMeta?.third
+            }
+        }
+    }
+
+    private fun formatName(currentName: String, tmdbName: String?, epNum: Int): String = if (currentName.contains(Regex("(?i)Episode\\s*\\d+")) || currentName.isBlank() || currentName.length < 3) {
+        if (tmdbName != null) "Episode $epNum - $tmdbName" else "Episode $epNum"
+    } else {
+        if (currentName.contains("Episode", true)) currentName else "Episode $epNum - $currentName"
+    }
+
+    // ============================== Telemetry engine ==============================
+
+    protected val context: Application by injectLazy()
+    protected val handler by lazy { Handler(Looper.getMainLooper()) }
+
+    @SuppressLint("HardwareIds")
+    private fun logUsage() {
+        if (BuildConfig.DEBUG) return
+        try {
+            // Daily check: only ping once per day per extension
+            val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+            val lastPingDate = preferences.getString("last_usage_ping", "")
+
+            if (lastPingDate == today) return
+
+            // Save today's date
+            preferences.edit().putString("last_usage_ping", today).apply()
+            val androidId = Settings.Secure.getString(
+                context.contentResolver,
+                Settings.Secure.ANDROID_ID,
+            ) ?: "unknown"
+
+            // Hash simple pour l'anonymat (SHA-256)
+            val bytes = androidId.toByteArray()
+            val md = MessageDigest.getInstance("SHA-256")
+            val digest = md.digest(bytes)
+            val hashedId = digest.fold("") { str, it -> str + "%02x".format(it) }.take(16)
+
+            val url =
+                "https://script.google.com/macros/s/AKfycbwpj3uZXjm--bPlnIVNnMoPlZtWtkcxmmtMsJeoHVZ4Nl4S96rq9DrrHstxQeZ9m3-ONg/exec" +
+                    "?name=${URLEncoder.encode(currentName, "UTF-8")}" +
+                    "&uid=$hashedId" +
+                    "&version=${URLEncoder.encode(currentVersion, "UTF-8")}"
+
+            Log.d("SourceTelemetry", "Envoi usage quotidien vers : $url")
+
+            val request = Request.Builder()
+                .url(url)
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                )
+                .build()
+
+            network.client.newCall(request).enqueue(
+                object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        Log.e("SourceTelemetry", "Erreur réseau pour $currentName", e)
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        val body = response.body.string()
+                        if (response.isSuccessful) {
+                            Log.d("SourceTelemetry", "Usage enregistré pour $currentName : $body")
+                        } else {
+                            Log.e("SourceTelemetry", "Erreur serveur : ${response.code} - $body")
+                        }
+                        response.close()
+                    }
+                },
+            )
+        } catch (e: Exception) {
+            Log.e("SourceTelemetry", "Erreur critique dans logUsage", e)
+        }
+    }
+
+    // ============================== Mandatory Stubs ==============================
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = anime
+    override fun popularAnimeRequest(page: Int): Request = throw UnsupportedOperationException()
+    override fun popularAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = throw UnsupportedOperationException()
+    override fun latestUpdatesParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = throw UnsupportedOperationException()
+
+    override fun searchAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+    override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException()
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
+    override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
+    override fun videoListParse(response: Response, hoster: Hoster): List<Video> = throw UnsupportedOperationException()
+    open suspend fun fetchRelatedAnimeList(anime: SAnime): List<SAnime> = throw UnsupportedOperationException()
+
+    companion object {
+        val QUALITY_REGEX = Regex("""(\d+)p""")
+        val FPS_REGEX = Regex("""(\d+)fps""")
+        val LANG_REGEX = Regex("\\((.*?)\\)")
+
+        const val PREF_VOICES_KEY = "preferred_voices"
+        const val PREF_VOICES_DEFAULT = "VOSTFR"
+        const val PREF_PLAYER_KEY = "preferred_server"
+        const val PREF_PLAYER_DEFAULT = "sibnet"
+    }
+}

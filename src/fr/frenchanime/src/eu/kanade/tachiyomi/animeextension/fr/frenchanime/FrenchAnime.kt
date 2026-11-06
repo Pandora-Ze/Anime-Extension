@@ -1,0 +1,184 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package eu.kanade.tachiyomi.animeextension.fr.frenchanime
+
+import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
+import eu.kanade.tachiyomi.animesource.model.SAnime
+import eu.kanade.tachiyomi.animesource.model.SEpisode
+import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
+import fr.bluecxt.core.model.SelectorException
+import fr.bluecxt.core.preference.CommonPreferences
+import fr.bluecxt.core.source.ConfigurableSource
+import fr.bluecxt.core.utils.safeRelativePath
+import keiyoushi.utils.useAsJsoup
+import kotlinx.serialization.json.Json
+import uy.kohesive.injekt.injectLazy
+
+class FrenchAnime : ConfigurableSource() {
+
+    override val name = "French Anime"
+    override val defaultBaseUrl = "https://french-anime.com"
+
+    override val lang = "fr"
+    override val supportsLatest = false
+
+    override val supportedServers = listOf(
+        "Filemoon",
+        "Lulu",
+        "Dood",
+        "Uqload",
+        "Vidoza",
+        "Sibnet",
+        "Vidmoly",
+        "Voe",
+        "Vudeo",
+        "Vido",
+        "StreamHide",
+        "StreamVid",
+        "StreamHub",
+        "Upstream",
+    )
+
+    override val json: Json by injectLazy()
+
+// ============================== Popular ===============================
+    override suspend fun getPopularAnime(page: Int): AnimesPage {
+        val response = client.newCall(GET("$baseUrl/animes-vostfr/page/$page/", headers)).awaitSuccess()
+        val document = response.useAsJsoup()
+        val animes = document.select("div#dle-content > div.mov").mapNotNull { element ->
+            SAnime.create().apply {
+                val link = element.selectFirst("a[href]") ?: throw SelectorException("link not found")
+                url = link.safeRelativePath() ?: return@mapNotNull null
+
+                thumbnail_url = element.selectFirst("img[src]")?.absUrl("src") ?: ""
+                title = "${link.text()} ${element.selectFirst("span.block-sai")?.text() ?: ""}".trim()
+            }
+        }
+        val hasNextPage = document.selectFirst("span.navigation > span:not(.nav_ext) + a") != null
+        return AnimesPage(animes, hasNextPage)
+    }
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage {
+        val response = client.newCall(GET("$baseUrl/page/$page/", headers)).awaitSuccess()
+        return getPopularAnime(page) // Reuse logic
+    }
+
+    // =============================== Search ===============================
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val form = okhttp3.FormBody.Builder()
+            .add("do", "search")
+            .add("subaction", "search")
+            .add("story", query)
+            .apply {
+                if (page > 1) {
+                    add("search_start", page.toString())
+                }
+            }
+            .build()
+        val searchHeaders = headers.newBuilder()
+            .add("Origin", baseUrl)
+            .add("Referer", "$baseUrl/")
+            .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .build()
+        val response = client.newCall(eu.kanade.tachiyomi.network.POST("$baseUrl/", searchHeaders, form)).awaitSuccess()
+        val document = response.useAsJsoup()
+        val animes = document.select("div.mov").mapNotNull { element ->
+            val link = element.selectFirst("a.mov-t") ?: element.selectFirst("a[href]") ?: return@mapNotNull null
+            val path = link.safeRelativePath() ?: return@mapNotNull null
+
+            val details = element.selectFirst("span.block-sai")?.text()?.trim() ?: ""
+            val season = details.filter { it.isDigit() }.toIntOrNull()
+            val langMatch = Regex("(?i)vostfr|vf|french").find(details)?.value?.uppercase()
+            val lang = if (langMatch == "FRENCH") "VF" else langMatch
+
+            SAnime.create().apply {
+                url = path
+                thumbnail_url = element.selectFirst("img[src]")?.absUrl("src") ?: ""
+                title = buildString {
+                    append(link.text())
+                    if (season != null) append(" $season")
+                    if (lang != null) append(" $lang")
+                }
+            }
+        }
+        val hasNextPage = document.selectFirst("span.navigation > span:not(.nav_ext) + a") != null
+        return AnimesPage(animes, hasNextPage)
+    }
+
+    // =========================== Anime Details ============================
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+        val response = client.newCall(GET("$baseUrl${anime.url}", headers)).awaitSuccess()
+        val document = response.useAsJsoup()
+
+        anime.thumbnail_url = document.selectFirst("#posterimg")?.absUrl("src") ?: anime.thumbnail_url
+
+        val movList = document.select("ul.mov-list li")
+        val synopsis = movList.select("div.mov-label:contains(Synopsis:) + div.mov-desc").text()
+
+        anime.description = synopsis
+        anime.genre = movList.select("div.mov-label:contains(GENRE:) + div.mov-desc a").joinToString { it.text() }
+        anime.artist = movList.select("div.mov-label:contains(RÉALISATEUR:) + div.mov-desc").text().ifBlank { null }
+
+        return anime
+    }
+
+    // ============================== Episodes ==============================
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        val response = client.newCall(GET("$baseUrl${anime.url}", headers)).awaitSuccess()
+        val document = response.useAsJsoup()
+        val episodeList = mutableListOf<SEpisode>()
+        val lang = if (document.baseUri().contains("-vf")) "VF" else "VOSTFR"
+
+        val epsData = document.selectFirst("div.eps")?.text() ?: return emptyList()
+
+        val sNumRegex = Regex("""(?i)(?:Saison|Season)\s*(\d+)""")
+        val sNumMatch = sNumRegex.find(anime.title)
+        val sNum = sNumMatch?.groupValues?.get(1)?.toIntOrNull() ?: 1
+        val sPrefix = if (sNumMatch != null && sNum > 1) "[S$sNum] " else ""
+
+        epsData.split(" ").filter { it.isNotBlank() }.forEach {
+            val data = it.split("!", limit = 2)
+            val epNumStr = data[0]
+            val epNum = epNumStr.toFloatOrNull() ?: 0F
+
+            episodeList.add(
+                SEpisode.create().apply {
+                    this.episode_number = epNum
+                    this.name = "${sPrefix}Episode $epNumStr"
+                    this.url = "$lang|${data[1]}"
+                    this.scanlator = lang
+                },
+            )
+        }
+
+        return episodeList.asReversed()
+    }
+
+    // ============================ Video Links =============================
+
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        val parts = episode.url.split("|")
+        val lang = parts.getOrNull(0) ?: "VOSTFR"
+        val rawUrl = parts.getOrNull(1) ?: episode.url
+
+        return listOf(
+            Hoster(
+                hosterName = lang,
+                hosterUrl = rawUrl,
+            ),
+        )
+    }
+
+    override suspend fun getVideoList(hoster: Hoster): List<Video> {
+        val rawUrl = hoster.hosterUrl
+        val lang = hoster.hosterName
+
+        return rawUrl.split(",").filter { it.isNotBlank() }.flatMap { playerUrl ->
+            extractVideos(playerUrl, lang, supportedServers)
+        }
+    }
+}

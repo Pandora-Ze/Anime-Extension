@@ -1,0 +1,193 @@
+name: Check Upstream Lib Changes
+
+on:
+  schedule:
+    # Tous les jeudis à 21:00 UTC
+    - cron: '0 21 * * 4'
+  workflow_dispatch:
+
+jobs:
+  check-lib:
+    name: Check lib/ changes (Weekly)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout local repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect Weekly Changes
+        id: detect
+        run: |
+          UPSTREAM_URL="https://github.com/yuzono/anime-extensions.git"
+
+          git clone --filter=blob:none $UPSTREAM_URL repo
+          cd repo
+
+          COMMITS=$(git log --since="7 days ago" --oneline -- lib/)
+          DIFF_FILES=$(git log --since="7 days ago" --name-only --pretty=format:"" -- lib/ | sort -u | grep -v '^$')
+
+          if [ -n "$COMMITS" ]; then
+            MODIFIED_MODULES=$(echo "$DIFF_FILES" | cut -d'/' -f2 | sort -u | tr '\n' ' ' | sed 's/ $//')
+
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "modules=$MODIFIED_MODULES" >> $GITHUB_OUTPUT
+
+            echo "files<<EOF" >> $GITHUB_OUTPUT
+            echo "$DIFF_FILES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+
+            echo "commits<<EOF" >> $GITHUB_OUTPUT
+            echo "$COMMITS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+
+            DIFF_TEXT=$(git log -p --since="7 days ago" -- lib/ | head -c 45000)
+            DELIM="DIFF_EOF_$(date +%s)"
+            echo "diff<<$DELIM" >> $GITHUB_OUTPUT
+            echo "$DIFF_TEXT" >> $GITHUB_OUTPUT
+            echo "$DELIM" >> $GITHUB_OUTPUT
+
+            echo "### ⚠️ Changements détectés dans lib/ cette semaine !" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "$DIFF_FILES" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "### ✅ Aucun changement dans lib/ cette semaine." >> $GITHUB_STEP_SUMMARY
+          fi
+          cd ..
+
+      - name: Create Issue on Changes
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODULES: ${{ steps.detect.outputs.modules }}
+          FILES: ${{ steps.detect.outputs.files }}
+          COMMITS: ${{ steps.detect.outputs.commits }}
+          DIFF: ${{ steps.detect.outputs.diff }}
+        run: |
+          DATE=$(date +'%d/%m/%Y')
+          ISSUE_TITLE="[Upstream] Changements lib/ du $DATE"
+          FORMATTED_MODULES=$(for m in $MODULES; do echo "- $m"; done)
+          ISSUE_BODY="Les modules suivants dans le dossier \`lib/\` ont été modifiés sur le dépôt upstream (yuzono/anime-extensions) cette semaine :
+
+          **Modules concernés :**
+          $FORMATTED_MODULES
+
+          **Commits :**
+          \`\`\`
+          $COMMITS
+          \`\`\`
+
+          **Fichiers modifiés :**
+          \`\`\`
+          $FILES
+          \`\`\`
+
+          <details>
+          <summary><b>Afficher le diff complet</b></summary>
+
+          \`\`\`diff
+          $DIFF
+          \`\`\`
+          </details>
+
+          Veuillez vérifier l'impact sur nos extensions."
+
+          EXISTING_ISSUE=$(gh issue list --search "$ISSUE_TITLE" --state open --json number --jq '.[0].number')
+
+          if [ -z "$EXISTING_ISSUE" ]; then
+            gh issue create --title "$ISSUE_TITLE" --body "$ISSUE_BODY" --label "enhancement"
+          else
+            gh issue comment "$EXISTING_ISSUE" --body "Nouvelle détection de changements Yuzono : $ISSUE_BODY"
+          fi
+
+  check-docchi-players:
+    name: Check Docchi-Players changes (Weekly)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout local repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect Weekly Changes
+        id: detect-docchi
+        run: |
+          DOCCHI_URL="https://github.com/skoruppa/docchi-players.git"
+          
+          git clone --filter=blob:none $DOCCHI_URL repo_docchi
+          cd repo_docchi
+          
+          COMMITS=$(git log --since="7 days ago" --oneline)
+          DIFF_FILES=$(git log --since="7 days ago" --name-only --pretty=format:"" | sort -u | grep -v '^$')
+          
+          if [ -n "$COMMITS" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            
+            echo "files<<EOF" >> $GITHUB_OUTPUT
+            echo "$DIFF_FILES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            
+            echo "commits<<EOF" >> $GITHUB_OUTPUT
+            echo "$COMMITS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+
+            DIFF_TEXT=$(git log -p --since="7 days ago" | head -c 45000)
+            DELIM="DIFF_EOF_$(date +%s)"
+            echo "diff<<$DELIM" >> $GITHUB_OUTPUT
+            echo "$DIFF_TEXT" >> $GITHUB_OUTPUT
+            echo "$DELIM" >> $GITHUB_OUTPUT
+
+            echo "### ⚠️ Nouveaux commits cette semaine sur Docchi-players !" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "$COMMITS" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "### ✅ Aucun changement cette semaine sur Docchi-players." >> $GITHUB_STEP_SUMMARY
+          fi
+          cd ..
+
+      - name: Create Issue on Weekly Docchi Changes
+        if: steps.detect-docchi.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FILES: ${{ steps.detect-docchi.outputs.files }}
+          COMMITS: ${{ steps.detect-docchi.outputs.commits }}
+          DIFF: ${{ steps.detect-docchi.outputs.diff }}
+        run: |
+          DATE=$(date +'%d/%m/%Y')
+          ISSUE_TITLE="[Docchi] Nouveaux commits sur main (Semaine du $DATE)"
+          
+          ISSUE_BODY="Des modifications ont été publiées cette semaine sur la branche \`main\` du dépôt **skoruppa/docchi-players**.
+          
+          **Commits de la semaine :**
+          \`\`\`
+          $COMMITS
+          \`\`\`
+          
+          **Fichiers modifiés :**
+          \`\`\`
+          $FILES
+          \`\`\`
+
+          <details>
+          <summary><b>Afficher le diff complet</b></summary>
+
+          \`\`\`diff
+          $DIFF
+          \`\`\`
+          </details>
+          
+          Évaluez si une synchronisation contractuelle ou technique est requise de notre côté."
+          
+          EXISTING_ISSUE=$(gh issue list --search "$ISSUE_TITLE" --state open --json number --jq '.[0].number')
+          
+          if [ -z "$EXISTING_ISSUE" ]; then
+            gh issue create --title "$ISSUE_TITLE" --body "$ISSUE_BODY" --label "enhancement"
+          else
+            gh issue comment "$EXISTING_ISSUE" --body "Mise à jour des modifications hebdomadaires : $ISSUE_BODY"
+          fi

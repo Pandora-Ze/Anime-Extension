@@ -1,0 +1,8 @@
+ext {
+    extName = 'French-Manga'
+    extClass = '.FrenchManga'
+    extVersionCode = 22
+    isNsfw = false
+}
+
+apply plugin: "kei.plugins.extension.legacy"

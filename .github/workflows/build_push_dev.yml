@@ -1,0 +1,46 @@
+name: CI Dev
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - "src/**"
+      - "core/**"
+      - "lib-multisrc/**"
+      - "gradle/**"
+      - "config/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - ".github/scripts/move-built-apks.py"
+      - ".github/scripts/create-repo.py"
+      - ".github/workflows/build_push_dev.yml"
+      - ".github/workflows/reusable_build_publish.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-publish:
+    uses: ./.github/workflows/reusable_build_publish.yml
+    with:
+      channel: 'dev'
+      gradle_task: 'assembleDev'
+      apk_path: 'src/*/*/build/outputs/apk/dev/*.apk'
+      repo_name: 'bluecxt french repo dev'
+      short_name: 'bluecxt-dev'
+      author: 'bluecxt (Dev)'
+    secrets:
+      signing_key: ${{ secrets.DEV_SIGNING_KEY }}
+      alias: ${{ secrets.DEV_ALIAS }}
+      key_store_password: ${{ secrets.DEV_KEY_STORE_PASSWORD }}
+      key_password: ${{ secrets.DEV_KEY_PASSWORD }}
+      tmdb_api: ${{ secrets.TMDB_API }}
+      tvdb_api: ${{ secrets.TVDB_API }}
+      webhook_url: ${{ secrets.WEBHOOK_URL }}
+      webhook_secret: ${{ secrets.WEBHOOK_SECRET }}

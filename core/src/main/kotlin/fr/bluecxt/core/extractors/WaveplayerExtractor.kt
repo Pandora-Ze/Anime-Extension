@@ -1,0 +1,27 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package fr.bluecxt.core.extractors
+
+import android.util.Log
+import eu.kanade.tachiyomi.animesource.model.Track
+import fr.bluecxt.core.model.ExtractedSource
+import okhttp3.Headers
+import okhttp3.OkHttpClient
+
+class WaveplayerExtractor(private val client: OkHttpClient, private val headers: Headers) {
+    fun videosFromUrl(
+        masterUrl: String,
+        refererUrl: String,
+        subtitleTracks: List<Track> = emptyList(),
+    ): List<ExtractedSource> {
+        val extHeaders = Headers.Builder().add("Referer", refererUrl).build()
+
+        return listOf(
+            ExtractedSource(
+                url = masterUrl,
+                headers = extHeaders,
+                subtitleTracks = subtitleTracks,
+            ),
+        )
+    }
+}

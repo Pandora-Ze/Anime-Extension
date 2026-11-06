@@ -1,0 +1,89 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package fr.bluecxt.core.extractors
+
+import android.util.Log
+import eu.kanade.tachiyomi.network.GET
+import fr.bluecxt.core.VIDMOLY_LOG
+import fr.bluecxt.core.model.ContentUnavailableException
+import fr.bluecxt.core.model.ExtractedSource
+import fr.bluecxt.core.model.ExtractionException
+import fr.bluecxt.core.utils.awaitSuccessOrUnavailable
+import fr.bluecxt.core.utils.safeRelativePath
+import fr.bluecxt.core.utils.toDoc
+import fr.bluecxt.core.utils.video.PlaylistUtils
+import keiyoushi.utils.parallelCatchingFlatMap
+import okhttp3.Headers
+import okhttp3.OkHttpClient
+
+class VidmolyExtractor(private val client: OkHttpClient, headers: Headers = Headers.EMPTY) {
+
+    companion object {
+        const val BASE_URL = "https://ansembed.net"
+
+        private val sourcesRegex by lazy { Regex("""sources\s*:\s*(.+?]),""", RegexOption.DOT_MATCHES_ALL) }
+        private val urlsRegex by lazy { Regex("""file\s*:\s*["'](.+?)["']""") }
+
+        const val VIDEO_DELETED = "h2:contains(Sorry)"
+
+        private const val DESKTOP_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    }
+
+    private val playlistUtils by lazy { PlaylistUtils(client) }
+
+    private val headers: Headers = headers.newBuilder()
+        .set("User-Agent", DESKTOP_USER_AGENT)
+        .set("Referer", "$BASE_URL/")
+        .set("Connection", "close")
+        .build()
+
+    suspend fun videosFromUrl(iframeUrl: String): List<ExtractedSource> {
+        val url = if (iframeUrl.contains("vidmoly")) {
+            BASE_URL + (iframeUrl.safeRelativePath(BASE_URL) ?: "")
+        } else {
+            iframeUrl
+        }
+        Log.v(VIDMOLY_LOG, if (url == iframeUrl) "url non changed" else "url changed to vidmoly.biz was $iframeUrl")
+
+        Log.d(VIDMOLY_LOG, "Fetching Vidmoly page from: $url")
+
+        val response = client.newCall(GET(url, headers)).awaitSuccessOrUnavailable(url)
+
+        val document = response.toDoc(url)
+
+        if (document.selectFirst(VIDEO_DELETED) != null || !document.location().contains(".html")) {
+            Log.d(VIDMOLY_LOG, "$url Video non available")
+            throw ContentUnavailableException("Video non available (detected in DOM) $url")
+        }
+        val script = document.selectFirst("script:containsData(sources)")?.data()
+            ?: throw ExtractionException("Could not find player script for $url")
+
+        val sources = sourcesRegex.find(script)?.groupValues[1]
+            ?: throw ExtractionException("Could not find sources in script for $url")
+
+        val urls = urlsRegex.findAll(sources)
+            .mapNotNull { match -> match.groupValues[1].takeIf { it.isNotBlank() } }
+            .map { rawUrl ->
+                if (rawUrl.contains("_l/master.m3u8")) {
+                    rawUrl.replace("_l/master.m3u8", "_,n,l,.urlset/master.m3u8")
+                } else {
+                    rawUrl
+                }
+            }
+            .toList()
+
+        if (urls.isEmpty()) throw ExtractionException("No video URLs found in sources for $url")
+
+        Log.d(VIDMOLY_LOG, "Script found (${urls.size} video URLs), extracting HLS playlists...")
+
+        return urls.parallelCatchingFlatMap { videoUrl ->
+            Log.d(VIDMOLY_LOG, "Extracting HLS playlist for $videoUrl")
+            playlistUtils.extractFromHls(
+                videoUrl,
+                masterHeaders = headers,
+                videoHeaders = headers,
+            )
+        }
+    }
+}

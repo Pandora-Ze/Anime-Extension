@@ -1,0 +1,29 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package fr.bluecxt.core.extractors
+
+import eu.kanade.tachiyomi.network.GET
+import fr.bluecxt.core.model.ExtractedSource
+import fr.bluecxt.core.utils.awaitSuccessOrUnavailable
+import fr.bluecxt.core.utils.unpacker.autoUnpacker
+import fr.bluecxt.core.utils.video.PlaylistUtils
+import keiyoushi.utils.useAsJsoup
+import okhttp3.OkHttpClient
+
+class StreamVidExtractor(private val client: OkHttpClient) {
+    private val playlistUtils by lazy { PlaylistUtils(client) }
+
+    suspend fun videosFromUrl(url: String, sourceChange: Boolean = false): List<ExtractedSource> = runCatching {
+        val response = client.newCall(GET(url)).awaitSuccessOrUnavailable(url)
+        val doc = response.useAsJsoup()
+        val script = doc.selectFirst("script:containsData(eval):containsData(p,a,c,k,e,d)")?.data()
+            ?.let { autoUnpacker(it) }
+            ?: return emptyList()
+        val masterUrl = if (!sourceChange) {
+            script.substringAfter("sources:[{src:\"").substringBefore("\",")
+        } else {
+            script.substringAfter("sources:[{file:\"").substringBefore("\"")
+        }
+        playlistUtils.extractFromHls(masterUrl)
+    }.getOrElse { emptyList() }
+}

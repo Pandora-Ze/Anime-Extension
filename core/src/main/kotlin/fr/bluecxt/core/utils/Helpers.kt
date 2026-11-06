@@ -1,0 +1,295 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package fr.bluecxt.core.utils
+
+import eu.kanade.tachiyomi.animesource.model.SAnime
+import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.network.await
+import fr.bluecxt.core.DEFAULT_USER_AGENT
+import fr.bluecxt.core.model.ContentUnavailableException
+import fr.bluecxt.core.model.ExtractionException
+import fr.bluecxt.core.model.RateLimitException
+import keiyoushi.utils.useAsJsoup
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Response
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+
+/**
+ * Safely extracts the relative path from an element's href attribute.
+ * Uses abs:href to ensure a full URL is parsed, then returns only the encoded path.
+ */
+fun Element.safeRelativePath(): String? {
+    val url = this.attr("abs:href").toHttpUrlOrNull() ?: return null
+    val query = url.encodedQuery
+    return if (query.isNullOrBlank()) url.encodedPath else "${url.encodedPath}?$query"
+}
+
+/**
+ * Resolves a URL (relative or absolute) against a base URL and returns the cleaned relative path.
+ * Uses OkHttp's resolve engine to handle normalization and special characters.
+ */
+fun String.safeRelativePath(base: String): String? {
+    val url = base.toHttpUrlOrNull()?.resolve(this) ?: return null
+    val query = url.encodedQuery
+    return if (query.isNullOrBlank()) url.encodedPath else "${url.encodedPath}?$query"
+}
+
+/**
+ * Returns a new Video instance with secured headers.
+ * Injects the global DEFAULT_USER_AGENT and sets the Referer to baseUrl if missing.
+ * Useful for bypassing 403 Forbidden errors on various hosters.
+ */
+fun Video.withDefaultHeaders(baseUrl: String): Video {
+    val builder = this.headers?.newBuilder() ?: Headers.Builder()
+
+    if (this.headers?.get("Referer") == null) {
+        builder["Referer"] = "$baseUrl/"
+    }
+
+    return this.copy(headers = builder.build())
+}
+
+private val CHROME_VERSION_REGEX = Regex("""Chrome/(\d+)""")
+
+/**
+ * Automatically infers and adds Sec-CH-UA, Sec-CH-UA-Mobile, and Sec-CH-UA-Platform Client Hints
+ * derived from the given or active User-Agent string.
+ */
+fun Headers.Builder.addClientHints(userAgent: String? = null): Headers.Builder {
+    val actualUserAgent = userAgent ?: DEFAULT_USER_AGENT ?: throw IllegalStateException()
+    val chromeMatch = CHROME_VERSION_REGEX.find(actualUserAgent)
+    if (chromeMatch != null) {
+        val major = chromeMatch.groupValues[1]
+        val isMobile = actualUserAgent.contains("Mobile", ignoreCase = true)
+        val platform = when {
+            actualUserAgent.contains("Android", ignoreCase = true) -> "\"Android\""
+            actualUserAgent.contains("Windows", ignoreCase = true) -> "\"Windows\""
+            actualUserAgent.contains("Mac", ignoreCase = true) -> "\"macOS\""
+            actualUserAgent.contains("Linux", ignoreCase = true) -> "\"Linux\""
+            else -> "\"Android\""
+        }
+        set("Sec-CH-UA", "\"Chromium\";v=\"$major\", \"Not:A-Brand\";v=\"24\", \"Google Chrome\";v=\"$major\"")
+        set("Sec-CH-UA-Mobile", if (isMobile) "?1" else "?0")
+        set("Sec-CH-UA-Platform", platform)
+    }
+    return this
+}
+
+/**
+ * Simple builder for basic headers with automatic Client Hints injection
+ */
+fun defaultHeaders(
+    userAgent: String? = null,
+    referer: String = "",
+    origin: String = "",
+    accept: String = "",
+    addClientHints: Boolean = true,
+): Headers = Headers.Builder()
+    .apply {
+        if (referer.isNotBlank()) add("Referer", referer)
+        if (origin.isNotBlank()) add("Origin", origin)
+        if (accept.isNotBlank()) add("Accept", accept)
+        if (addClientHints) addClientHints(userAgent)
+    }.build()
+
+/**
+ * Normalize a String by putting everything in lowercase and keep only letter and digit
+ */
+fun String.normalize(): String = lowercase().filter { it.isLetterOrDigit() }.trim()
+
+/**
+ * Awaits response and verifies status:
+ * - Throws ContentUnavailableException on 404 or 410 (dead/unavailable content)
+ * - Throws ExtractionException on non-2xx status codes
+ * Automatically closes response on failure.
+ */
+suspend fun Call.awaitSuccessOrUnavailable(
+    url: String = "",
+    unavailableCodes: Set<Int> = setOf(404, 410),
+    rateLimitCodes: Set<Int> = setOf(429),
+    throwNonSuccessful: Boolean = true,
+): Response {
+    val response = this.await()
+    if (response.code in unavailableCodes) {
+        response.close()
+        throw ContentUnavailableException("Video unavailable (${response.code}) $url")
+    }
+    if (response.code in rateLimitCodes) {
+        response.close()
+        throw RateLimitException("Rate limited (${response.code}) for $url")
+    }
+    if (throwNonSuccessful && !response.isSuccessful) {
+        val errCode = response.code
+        val errMsg = response.message
+        response.close()
+        throw ExtractionException("HTTP $errCode ($errMsg) for $url")
+    }
+    return response
+}
+
+/**
+ * Convert a response to jsoup document with handling in the different error used in extractors
+ */
+fun Response.toDoc(url: String = ""): Document = this.use { res ->
+    if (res.code == 404 || res.code == 410) {
+        throw ContentUnavailableException("Video unavailable (${res.code}) $url".trim())
+    }
+    if (!res.isSuccessful) {
+        throw ExtractionException("HTTP ${res.code} (${res.message}) for $url".trim())
+    }
+    res.useAsJsoup()
+}
+
+/**
+ * Returns response body string, throwing ContentUnavailableException on 404 or 410.
+ */
+fun Response.bodyStringOrUnavailable(url: String = ""): String = this.use { res ->
+    if (res.code == 404 || res.code == 410) {
+        throw ContentUnavailableException("Video unavailable (${res.code}) $url".trim())
+    }
+    if (!res.isSuccessful) {
+        throw ExtractionException("HTTP ${res.code} (${res.message}) for $url".trim())
+    }
+    res.body.string()
+}
+
+/**
+ * Parses a status string into SAnime status integer constants.
+ */
+fun String.parseStatus(): Int = when (this.trim().lowercase()) {
+    "en cours", "ongoing", "en-cours", "releasing", "airing", "en diffusion", "en cours de diffusion", "broadcasting", "continuing" -> SAnime.ONGOING
+    "terminé", "termine", "completed", "end", "ended", "finished", "fini", "complete", "complété", "sorti" -> SAnime.COMPLETED
+    "licencié", "licencie", "licensed" -> SAnime.LICENSED
+    "publishing finished" -> SAnime.PUBLISHING_FINISHED
+    "annulé", "annule", "canceled", "cancelled", "abandonné", "abandonne" -> SAnime.CANCELLED
+    "en pause", "on-hold", "on hold", "on_hiatus", "hiatus", "en attente", "paused" -> SAnime.ON_HIATUS
+    else -> SAnime.UNKNOWN
+}
+
+/**
+ * Calls the specified function [block] and returns its encapsulated result if invocation was successful,
+ * or the encapsulated exception on failure.
+ *
+ * Any [kotlinx.coroutines.CancellationException] thrown inside [block] is rethrown immediately
+ * to preserve coroutine cooperative cancellation.
+ */
+inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (e: kotlinx.coroutines.CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    Result.failure(e)
+}
+
+/**
+ * Parallel implementation of [Iterable.mapNotNull], running the transform function
+ * inside [runCatchingCancellable] on [Dispatchers.IO].
+ *
+ * Catches and ignores failures while preserving coroutine cooperative cancellation.
+ *
+ * Note: Do NOT use [kotlinx.coroutines.withTimeout] inside [f] as it throws
+ * [kotlinx.coroutines.TimeoutCancellationException], which would cancel sibling coroutines.
+ */
+suspend inline fun <A, B> Iterable<A>.parallelCatchingCancellableMapNotNull(
+    crossinline f: suspend (A) -> B?,
+): List<B> = withContext(Dispatchers.IO) {
+    map {
+        async {
+            runCatchingCancellable { f(it) }.getOrNull()
+        }
+    }.awaitAll().filterNotNull()
+}
+
+/**
+ * Thread-blocking parallel implementation of [Iterable.mapNotNull], running the transform function
+ * inside [runCatchingCancellable] on [Dispatchers.IO].
+ */
+inline fun <A, B> Iterable<A>.parallelCatchingCancellableMapNotNullBlocking(
+    crossinline f: suspend (A) -> B?,
+): List<B> = runBlocking { parallelCatchingCancellableMapNotNull(f) }
+
+/**
+ * Parallel implementation of [Iterable.flatMap], running the transform function
+ * inside [runCatchingCancellable] on [Dispatchers.IO].
+ *
+ * Catches and ignores failures while preserving coroutine cooperative cancellation.
+ *
+ * Note: Do NOT use [kotlinx.coroutines.withTimeout] inside [f] as it throws
+ * [kotlinx.coroutines.TimeoutCancellationException], which would cancel sibling coroutines.
+ */
+suspend inline fun <A, B> Iterable<A>.parallelCatchingCancellableFlatMap(
+    crossinline f: suspend (A) -> Iterable<B>,
+): List<B> = withContext(Dispatchers.IO) {
+    map {
+        async {
+            runCatchingCancellable { f(it) }.getOrNull()
+        }
+    }.awaitAll().filterNotNull().flatten()
+}
+
+/**
+ * Thread-blocking parallel implementation of [Iterable.flatMap], running the transform function
+ * inside [runCatchingCancellable] on [Dispatchers.IO].
+ */
+inline fun <A, B> Iterable<A>.parallelCatchingCancellableFlatMapBlocking(
+    crossinline f: suspend (A) -> Iterable<B>,
+): List<B> = runBlocking { parallelCatchingCancellableFlatMap(f) }
+
+/**
+ * Safely extracts the HTTP status code from an exception (especially [eu.kanade.tachiyomi.network.HttpException]).
+ *
+ * Prevents [NoSuchMethodError] on host apps (like AniZen) when R8/ProGuard shrinks or inlines
+ * the getter [eu.kanade.tachiyomi.network.HttpException.getCode].
+ */
+val Throwable.safeHttpCode: Int?
+    get() {
+        if (this.javaClass.name != "eu.kanade.tachiyomi.network.HttpException") {
+            return null
+        }
+        // 1. Direct getter method call (guarded against NoSuchMethodError / IncompatibleClassChangeError)
+        try {
+            val method = this.javaClass.getMethod("getCode")
+            val result = method.invoke(this) as? Int
+            if (result != null) return result
+        } catch (_: Throwable) {}
+
+        // 2. Field reflection
+        try {
+            val field = this.javaClass.getDeclaredField("code").apply { isAccessible = true }
+            val result = field.get(this) as? Int
+            if (result != null) return result
+        } catch (_: Throwable) {}
+
+        // 3. Fallback: Parse status code from message "HTTP error <code...>"
+        val msg = message ?: return null
+        return Regex("""\b(\d{3})\b""").find(msg)?.value?.toIntOrNull()
+    }
+
+@RequiresOptIn(
+    level = RequiresOptIn.Level.WARNING,
+    message = "This API is marked for refactoring. Check annotation parameter for details.",
+)
+@Retention(AnnotationRetention.BINARY)
+@Target(AnnotationTarget.FUNCTION, AnnotationTarget.CLASS, AnnotationTarget.PROPERTY)
+annotation class NeedsRefactor(
+    val reason: String = "",
+)
+
+fun CharSequence.containsAny(keywords: Array<String>): Boolean {
+    for (i in keywords.indices) {
+        if (this.contains(keywords[i], ignoreCase = true)) return true
+    }
+    return false
+}
+
+inline val Int.megabytes: Long get() = this.toLong() * 1024 * 1024
+inline val Int.kilobytes: Long get() = this.toLong() * 1024
+inline val Int.gigabytes: Long get() = this.toLong() * 1024 * 1024 * 1024

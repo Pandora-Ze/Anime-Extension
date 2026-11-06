@@ -1,0 +1,37 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package fr.bluecxt.core.extractors
+
+import eu.kanade.tachiyomi.network.GET
+import fr.bluecxt.core.model.ExtractedSource
+import fr.bluecxt.core.utils.awaitSuccessOrUnavailable
+import okhttp3.Headers
+import okhttp3.OkHttpClient
+
+class VidstreamExtractor(private val client: OkHttpClient) {
+    suspend fun videosFromUrl(url: String): List<ExtractedSource> {
+        val id = url.substringAfter("id=", "").substringBefore("&")
+        if (id.isEmpty()) return emptyList()
+
+        val headers = Headers.Builder()
+            .add("Referer", "https://lb.daisukianime.xyz/")
+            .add("Accept", "*/*")
+            .build()
+
+        return try {
+            val response = client.newCall(GET(url, headers)).awaitSuccessOrUnavailable(url)
+            val body = response.use { it.body.string() }
+            val videoUrl = body.substringAfter("file:\"", "").substringBefore("\"")
+            if (videoUrl.isEmpty()) return emptyList()
+
+            listOf(
+                ExtractedSource(
+                    url = videoUrl,
+                    headers = headers,
+                ),
+            )
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+}

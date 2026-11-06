@@ -1,0 +1,8 @@
+
+ext {
+    extName = 'AnimoFlix'
+    extClass = '.AnimoFlix'
+    extVersionCode = 21
+}
+
+apply plugin: "kei.plugins.extension.legacy"

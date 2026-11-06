@@ -1,0 +1,7 @@
+ext {
+    extName = 'Anime-Ultime'
+    extClass = '.AnimeUltime'
+    extVersionCode = 17
+}
+
+apply plugin: "kei.plugins.extension.legacy"

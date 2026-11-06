@@ -1,0 +1,9 @@
+
+ext {
+    extName = 'Les Poroïniens'
+    extClass = '.LesPoroiniens'
+    extVersionCode = 14
+    isNsfw = true
+}
+
+apply plugin: "kei.plugins.extension.legacy"

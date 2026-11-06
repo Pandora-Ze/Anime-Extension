@@ -1,0 +1,7 @@
+ext {
+    extName = 'VoirAnime'
+    extClass = '.VoirAnime'
+    extVersionCode = 32
+}
+
+apply plugin: "kei.plugins.extension.legacy"

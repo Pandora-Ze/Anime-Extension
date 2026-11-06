@@ -1,0 +1,17 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package fr.bluecxt.core.model
+
+import eu.kanade.tachiyomi.animesource.model.Track
+import okhttp3.Headers
+import okhttp3.HttpUrl
+
+data class ExtractedSource(
+    val url: String,
+    val quality: String? = null, // ex: "720p"
+    val frameRate: String? = null, // ex: "30fps"
+    var headers: Headers? = null,
+    var subtitleTracks: List<Track> = emptyList(),
+    var audioTracks: List<Track> = emptyList(),
+    var isError: Boolean = false,
+)

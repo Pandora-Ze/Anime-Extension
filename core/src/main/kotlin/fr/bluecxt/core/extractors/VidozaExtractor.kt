@@ -1,0 +1,70 @@
+// Copyright bluecxt
+// SPDX-License-Identifier: Apache-2.0
+package fr.bluecxt.core.extractors
+
+import android.util.Log
+import eu.kanade.tachiyomi.network.GET
+import fr.bluecxt.core.VIDOZA_LOG
+import fr.bluecxt.core.model.ExtractedSource
+import fr.bluecxt.core.utils.awaitSuccessOrUnavailable
+import fr.bluecxt.core.utils.defaultHeaders
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+
+// writed using https://github.com/skoruppa/docchi-players/blob/main/vidoza.py
+
+class VidozaExtractor(private val client: OkHttpClient) {
+    suspend fun videosFromUrl(url: String): List<ExtractedSource> {
+        val parsedUrl = url.toHttpUrl()
+
+        val host = parsedUrl.host
+
+        val videoId = parsedUrl.pathSegments.filter { it.isNotBlank() }.last()
+            .removePrefix("embed-")
+            .removeSuffix(".html")
+
+        val embedUrl = "https://$host/embed-$videoId.html"
+
+        val headers = defaultHeaders()
+
+        val response = client.newCall(GET(embedUrl, headers)).awaitSuccessOrUnavailable(embedUrl)
+        val html = response.use { it.body.string() }
+
+        val regex1 = Regex("""["']?\s*(?:file|src)\s*["']?\s*[:=,]?\s*["']([^"']+)(?:[^}>\]]+)["']?\s*res\s*["']?\s*[:=]\s*["']?([^"',]+)""")
+        val regex2 = Regex("""(?:file|src)\s*[:=]\s*["']([^"']+)["'].*?(?:label|res)\s*[:=]\s*["']?(\d+)""")
+        val regex3 = Regex("""(https?://[^"\']+\.mp4[^"\']*)""")
+
+        val matches = when {
+            regex1.containsMatchIn(html) -> regex1.findAll(html).toList()
+
+            regex2.containsMatchIn(html) -> regex2.findAll(html).toList()
+
+            regex3.containsMatchIn(html) -> {
+                return listOf(
+                    ExtractedSource(
+                        url = regex3.find(html)!!.groupValues[1],
+                        headers = headers,
+                    ),
+                )
+            }
+
+            else -> {
+                throw Exception("Vidoza: No video links found in HTML")
+            }
+        }
+
+        val videoList = matches.mapNotNull { match ->
+            val url = match.groupValues.get(1)
+            val quality = match.groupValues.get(2)
+            ExtractedSource(
+                url = url,
+                quality = quality,
+                headers = headers,
+            )
+        }
+
+        if (videoList.isEmpty()) throw Exception("Vidoza: Failed to parse video links from matches")
+
+        return videoList
+    }
+}

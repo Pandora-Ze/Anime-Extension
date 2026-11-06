@@ -1,0 +1,203 @@
+name: Reusable Build and Publish
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        required: true
+        type: string
+      gradle_task:
+        required: true
+        type: string
+      apk_path:
+        required: true
+        type: string
+      repo_name:
+        required: true
+        type: string
+      short_name:
+        required: true
+        type: string
+      author:
+        required: true
+        type: string
+    secrets:
+      signing_key:
+        required: true
+      alias:
+        required: true
+      key_store_password:
+        required: true
+      key_password:
+        required: true
+      tmdb_api:
+        required: true
+      tvdb_api:
+        required: true
+      webhook_url:
+        required: true
+      webhook_secret:
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  IS_PR_CHECK: false
+
+jobs:
+  build:
+    name: Build extensions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Force unique cache key based on task and channel
+        env:
+          GRADLE_TASK: ${{ inputs.gradle_task }}
+          CHANNEL: ${{ inputs.channel }}
+        run: echo "build.task=${GRADLE_TASK}-${CHANNEL}" >> gradle.properties
+
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6
+
+      - name: Clean up runner gradle.properties
+        run: rm -f ~/.gradle/gradle.properties
+
+      - name: Prepare signing key
+        env:
+          SIGNING_KEY: ${{ secrets.signing_key }}
+        run: |
+          if [ -n "$SIGNING_KEY" ]; then
+            echo "$SIGNING_KEY" | base64 -d > signingkey.jks
+            chmod 600 signingkey.jks
+          fi
+
+      - name: Build extensions
+        env:
+          ALIAS: ${{ secrets.alias }}
+          DEV_ALIAS: ${{ secrets.alias }}
+          KEY_STORE_PASSWORD: ${{ secrets.key_store_password }}
+          KEY_PASSWORD: ${{ secrets.key_password }}
+          TMDB_API: ${{ secrets.tmdb_api }}
+          TVDB_API: ${{ secrets.tvdb_api }}
+          WEBHOOK_URL: ${{ secrets.webhook_url }}
+          WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
+          GRADLE_TASK: ${{ inputs.gradle_task }}
+          APK_PATH: ${{ inputs.apk_path }}
+        run: |
+          ./gradlew "$GRADLE_TASK" && ls $APK_PATH
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: "individual-apks"
+          path: "${{ inputs.apk_path }}"
+          retention-days: 1
+
+      - name: Clean up CI files
+        run: rm -f signingkey.jks
+
+  publish:
+    name: Publish extension repo
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: individual-apks
+          path: ~/apk-artifacts
+
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Checkout repo branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: temp_gh_pages
+          persist-credentials: false
+
+      - name: Copy existing repo
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          if [ -d "temp_gh_pages/$CHANNEL" ]; then
+            cp -r "temp_gh_pages/$CHANNEL" repo
+          fi
+          rm -rf temp_gh_pages
+
+      - name: Move built APKs
+        run: |
+          mkdir -p repo
+          python3 ./.github/scripts/move-built-apks.py
+
+      - name: Download Extensions Inspector
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INSPECTOR_URL=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/bluecxt/aniyomi-extensions-inspector/releases/latest" | jq -r '.assets[] | select(.name | endswith(".jar")) | .browser_download_url' | head -n 1)
+          if [ -z "$INSPECTOR_URL" ] || [ "$INSPECTOR_URL" = "null" ]; then
+            echo "Error: Could not retrieve Inspector download URL."
+            exit 1
+          fi
+          curl -L -o ./Inspector.jar "$INSPECTOR_URL"
+          ls -lh ./Inspector.jar
+
+      - name: Generate Repository Metadata
+        env:
+          REPO_NAME: ${{ inputs.repo_name }}
+          SHORT_NAME: ${{ inputs.short_name }}
+          CHANNEL: ${{ inputs.channel }}
+          AUTHOR: ${{ inputs.author }}
+        run: |
+          java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
+          python3 ./.github/scripts/create-repo.py
+          cp repo/index.min.json repo/index.json
+
+      - name: Generate Repo Icon
+        run: |
+          sudo apt-get update && sudo apt-get install -y librsvg2-bin
+          rsvg-convert -w 512 -h 512 assets/repo_logo.svg -o repo/icon.png
+          cp repo/icon.png repo/logo.png
+
+      - name: Collect Commit Information
+        run: |
+          LATEST_MSG=$(git log -1 --pretty=%s | tr -d '\"')
+          LATEST_HASH=$(git log -1 --pretty=%H)
+          echo "LATEST_COMMIT_MESSAGE=$LATEST_MSG" >> $GITHUB_ENV
+          echo "LATEST_COMMIT_HASH=$LATEST_HASH" >> $GITHUB_ENV
+
+      - name: Deploy to repo branch
+        uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445
+        with:
+          branch: gh-pages
+          folder: repo
+          target-folder: ${{ inputs.channel }}
+          clean: true
+          commit-message: "Update extension repo ${{ inputs.channel }}: ${{ env.LATEST_COMMIT_MESSAGE }} (${{ env.LATEST_COMMIT_HASH }})"
